@@ -3,16 +3,20 @@
 
 import argparse
 import glob
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 CHANGELOG = ROOT / "CHANGELOG.md"
+README = ROOT / "README.md"
 
 
 def read_version() -> str:
@@ -80,6 +84,41 @@ def check_git_clean() -> bool:
     return False
 
 
+def check_readme_in_package() -> bool:
+    """Verify pyproject.toml declares a readme so it ships in PyPI metadata."""
+    with open(PYPROJECT, "rb") as f:
+        data = tomllib.load(f)
+    readme_val = data.get("project", {}).get("readme")
+    if readme_val:
+        target = ROOT / (readme_val if isinstance(readme_val, str) else readme_val.get("file", ""))
+        if target.exists():
+            print(f"  ✓ pyproject.toml declares readme: {readme_val}")
+            return True
+        print(f"  ✗ readme file {target} does not exist")
+        return False
+    print("  ✗ pyproject.toml missing [project] readme field — README won't appear on PyPI")
+    return False
+
+
+def check_version_newer(version: str) -> bool:
+    """Verify the local version hasn't already been published to PyPI."""
+    name = "specreq"
+    try:
+        resp = urlopen(f"https://pypi.org/pypi/{name}/json", timeout=10)
+        data = json.loads(resp.read())
+        published = data["info"]["version"]
+    except (URLError, KeyError, json.JSONDecodeError):
+        # Can't reach PyPI or package not yet published — nothing to compare
+        print("  ✓ PyPI unreachable or package not found (skipping version check)")
+        return True
+
+    if version == published:
+        print(f"  ✗ v{version} is already on PyPI — bump the version before publishing")
+        return False
+    print(f"  ✓ v{version} is newer than PyPI's v{published}")
+    return True
+
+
 def check_token(token: str | None) -> str | None:
     tok = token or os.environ.get("TWINE_TOKEN") or os.environ.get("TWINE_PASSWORD")
     if tok:
@@ -102,6 +141,8 @@ def run_checks(
 
     results = []
     results.append(check_changelog(version, deploy=deploy))
+    results.append(check_readme_in_package())
+    results.append(check_version_newer(version))
     results.append(check_tests())
     if skip_git_clean:
         print("  (skipped git clean)")

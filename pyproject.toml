@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specreq"
-version = "0.1.0"
+version = "0.1.1"
 description = "Write product specs as Python code."
 requires-python = ">=3.10"
+readme = "README.md"
 license = "MIT"
 authors = [
     { name = "William Hogben", email = "will@willhogben.com" },
