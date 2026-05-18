@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Pre-deploy checks and PyPI publish script."""
+
+import argparse
+import glob
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import tomllib
+
+ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = ROOT / "pyproject.toml"
+CHANGELOG = ROOT / "CHANGELOG.md"
+
+
+def read_version() -> str:
+    with open(PYPROJECT, "rb") as f:
+        return tomllib.load(f)["project"]["version"]
+
+
+def check_changelog(version: str, *, deploy: bool) -> bool:
+    if not CHANGELOG.exists():
+        print(f"  ✗ {CHANGELOG.name} not found")
+        return False
+    text = CHANGELOG.read_text()
+    sections: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("##") or stripped.startswith("###"):
+            continue
+        header = stripped[2:].strip().lstrip("v")
+        if header.startswith("["):
+            header = header[1:].split("]")[0]
+        elif " - " in header:
+            header = header.split(" - ", 1)[0].strip()
+        sections.add(header)
+
+    if "Unreleased" in sections:
+        print(f"  ✗ Changelog still has ## Unreleased — rename to [{version}] before publishing")
+        return False
+    if version in sections:
+        print(f"  ✓ Changelog has entry for {version}")
+        return True
+    print(f"  ✗ Changelog missing entry for {version}")
+    return False
+
+
+def check_tests() -> bool:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        print("  ✓ Tests pass")
+        return True
+    print("  ✗ Tests failed")
+    if result.stdout:
+        for line in result.stdout.splitlines()[-5:]:
+            print(f"    {line}")
+    return False
+
+
+def check_git_clean() -> bool:
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if not result.stdout.strip():
+        print("  ✓ Git clean")
+        return True
+    print("  ✗ Uncommitted changes:")
+    for line in result.stdout.strip().splitlines():
+        print(f"    {line}")
+    return False
+
+
+def check_token(token: str | None) -> str | None:
+    tok = token or os.environ.get("TWINE_TOKEN") or os.environ.get("TWINE_PASSWORD")
+    if tok:
+        print("  ✓ PyPI token present")
+        return tok
+    print("  ✗ No PyPI token (set TWINE_TOKEN or pass --token)")
+    return None
+
+
+def run_checks(
+    token: str | None,
+    *,
+    skip_git_clean: bool = False,
+    skip_pypi_token: bool = False,
+    deploy: bool = False,
+) -> tuple[bool, str | None]:
+    """Run all pre-deploy checks. Returns (all_passed, resolved_token)."""
+    version = read_version()
+    print(f"Pre-deploy checks for specreq v{version}:\n")
+
+    results = []
+    results.append(check_changelog(version, deploy=deploy))
+    results.append(check_tests())
+    if skip_git_clean:
+        print("  (skipped git clean)")
+    else:
+        results.append(check_git_clean())
+    if skip_pypi_token:
+        print("  (skipped PyPI token check)")
+        tok = token or os.environ.get("TWINE_TOKEN") or os.environ.get("TWINE_PASSWORD")
+    else:
+        tok = check_token(token)
+        results.append(tok is not None)
+
+    print()
+    all_passed = all(results)
+    if all_passed:
+        print("All checks passed.")
+    else:
+        print("Some checks failed.")
+    return all_passed, tok
+
+
+def deploy(version: str, token: str) -> None:
+    print(f"\nDeploying v{version}...\n")
+
+    for f in glob.glob(str(ROOT / "dist" / "*")):
+        os.remove(f)
+
+    print("  Building...")
+    subprocess.run([sys.executable, "-m", "build"], cwd=ROOT, check=True)
+
+    tag = f"v{version}"
+    existing = subprocess.run(
+        ["git", "tag", "-l", tag], cwd=ROOT, capture_output=True, text=True
+    )
+    if existing.stdout.strip():
+        print(f"  Tag {tag} already exists, skipping")
+    else:
+        print(f"  Tagging {tag}...")
+        subprocess.run(["git", "tag", tag], cwd=ROOT, check=True)
+
+    print("  Uploading to PyPI...")
+    dist_files = sorted(glob.glob(str(ROOT / "dist" / "*")))
+    if not dist_files:
+        print("  ✗ No files found in dist/")
+        sys.exit(1)
+    subprocess.run(
+        ["twine", "upload", *dist_files],
+        env={**os.environ, "TWINE_PASSWORD": token, "TWINE_USERNAME": "__token__"},
+        check=True,
+    )
+    print(f"\nPublished v{version} to PyPI.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Pre-deploy checks and publish")
+    parser.add_argument("--check", action="store_true", help="Run checks only (default)")
+    parser.add_argument("--deploy", action="store_true", help="Run checks then deploy")
+    parser.add_argument("--token", help="PyPI API token (or set TWINE_TOKEN)")
+    parser.add_argument("--skip-git-clean", action="store_true")
+    parser.add_argument("--skip-pypi-token", action="store_true")
+    args = parser.parse_args()
+
+    if not args.deploy:
+        args.check = True
+
+    if args.deploy and args.skip_pypi_token:
+        print("Cannot --deploy with --skip-pypi-token.", file=sys.stderr)
+        sys.exit(1)
+
+    passed, token = run_checks(
+        args.token,
+        skip_git_clean=args.skip_git_clean,
+        skip_pypi_token=args.skip_pypi_token,
+        deploy=args.deploy,
+    )
+
+    if not passed:
+        sys.exit(1)
+
+    if args.deploy:
+        if not token:
+            print("Deploy requires a PyPI token.", file=sys.stderr)
+            sys.exit(1)
+        deploy(read_version(), token)
+
+
+if __name__ == "__main__":
+    main()
