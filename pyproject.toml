@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specreq"
-version = "0.1.1"
+version = "0.1.2"
 description = "Write product specs as Python code."
 requires-python = ">=3.10"
 readme = "README.md"
@@ -14,6 +14,7 @@ authors = [
 ]
 urls.Homepage = "https://willhogben.com"
 urls.Repository = "https://github.com/whogben/specreq"
+urls.Changelog = "https://github.com/whogben/specreq/blob/main/CHANGELOG.md"
 dependencies = [
     "pydantic>=2.0",
     "typer>=0.9",
