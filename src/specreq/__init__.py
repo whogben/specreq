@@ -1,93 +1,101 @@
-"""specreq — write product specs as Python code."""
+"""specreq — define requirements as typed models, compose specs as JSON, validate products."""
 
 from __future__ import annotations
 
+import json
 import traceback
 from pathlib import Path
-from typing import TypeVar, Generic
+from typing import Any
 
 from pydantic import BaseModel
 
-T = TypeVar("T", bound=BaseModel)
+_REQ_REGISTRY: dict[str, type[Req]] = {}
 
 
-class Requirement(Generic[T]):
-    """Subclass to define a reusable spec element. Create instances to build a spec tree."""
+class Req(BaseModel):
+    """Base requirement. Subclass with typed fields and a kind discriminator."""
 
-    _instances: list[Requirement] = []
+    kind: str
+    children: list[Req] = []
 
-    def __init__(self, config: T | None = None, parent: Requirement | None = None):
-        self.config = config
-        self.parent = parent
-        self.children: list[Requirement] = []
-        if parent is not None:
-            parent.children.append(self)
-        Requirement._instances.append(self)
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        if "kind" in cls.model_fields:
+            default = cls.model_fields["kind"].default
+            if isinstance(default, str):
+                _REQ_REGISTRY[default] = cls
 
-    @staticmethod
-    def _format_node_exception(node: Requirement, exc: BaseException) -> str:
-        fqn = f"{node.__class__.__module__}.{node.__class__.__qualname__}"
+    def _format_node_exception(self, exc: BaseException) -> str:
+        fqn = f"{type(self).__module__}.{type(self).__qualname__}"
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         return f"exception at {fqn}: {type(exc).__name__}: {exc}\n{tb}"
 
     def _validate(self, product: Path, *, survive_exceptions: bool = True) -> list[str]:
-        """Run ``_validate`` on each child, then ``validate`` on this node.
-
-        Override this when you need to choose which children validate or in what order.
-        Forward ``survive_exceptions`` if you call ``super()._validate`` from a subclass.
-
-        When ``survive_exceptions`` is True (default), child failures are recorded with a
-        full traceback string and validation continues. When False, the first exception
-        propagates (``validate`` is never wrapped — only this orchestration).
-        """
+        """Validate children first, then self. Override to customize orchestration."""
         issues: list[str] = []
         for child in self.children:
             if survive_exceptions:
                 try:
                     issues.extend(
-                        child._validate(
-                            product, survive_exceptions=survive_exceptions
-                        )
+                        child._validate(product, survive_exceptions=survive_exceptions)
                     )
                 except Exception as e:
-                    issues.append(self._format_node_exception(child, e))
+                    issues.append(child._format_node_exception(e))
             else:
                 issues.extend(
-                    child._validate(
-                        product, survive_exceptions=survive_exceptions
-                    )
+                    child._validate(product, survive_exceptions=survive_exceptions)
                 )
         if survive_exceptions:
             try:
                 issues.extend(self.validate(product))
             except Exception as e:
-                issues.append(self._format_node_exception(self, e))
+                issues.append(self._format_node_exception(e))
         else:
             issues.extend(self.validate(product))
         return issues
 
     def validate(self, product: Path) -> list[str]:
-        """Return issues for this node only. Children are handled by ``_validate``."""
+        """Return issues for this node only. Children are handled by _validate."""
         return []
 
-    def to_dict(self) -> dict:
-        d: dict = {
-            "class": f"{self.__class__.__module__}.{self.__class__.__qualname__}",
-        }
-        if self.config is not None:
-            d["config"] = self.config.model_dump()
-        if self.children:
-            d["children"] = [c.to_dict() for c in self.children]
-        return d
-
-    @classmethod
-    def export_roots(cls) -> list[dict]:
-        """Serialize all root instances (no parent) as a list of dicts."""
-        return [i.to_dict() for i in cls._instances if i.parent is None]
-
-    @classmethod
-    def reset(cls):
-        cls._instances.clear()
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize with children preserving their actual subclass fields."""
+        exclude: set[str] = kwargs.pop("exclude", None) or set()
+        data = super().model_dump(exclude=exclude | {"children"}, **kwargs)
+        data["children"] = [c.model_dump(exclude=exclude, **kwargs) for c in self.children]
+        return data
 
 
-__all__ = ["Requirement"]
+Req.model_rebuild()
+
+
+def load_spec(source: Path | str | dict | list) -> list[Req]:
+    """Load specs from a JSON file path, dict, or list of dicts. Always returns a list."""
+    if isinstance(source, list):
+        return [_deserialize_req(item) for item in source]
+    if isinstance(source, dict):
+        data = source
+    else:
+        p = Path(source)
+        if not p.exists():
+            raise FileNotFoundError(f"Spec file not found: {p}")
+        data = json.loads(p.read_text())
+
+    if isinstance(data, list):
+        return [_deserialize_req(item) for item in data]
+    return [_deserialize_req(data)]
+
+
+def _deserialize_req(data: dict) -> Req:
+    kind = data.get("kind")
+    if kind not in _REQ_REGISTRY:
+        registered = ", ".join(sorted(_REQ_REGISTRY)) or "(none)"
+        raise ValueError(f"Unknown req kind: {kind!r}. Registered: {registered}")
+    cls = _REQ_REGISTRY[kind]
+    children = [_deserialize_req(c) for c in data.get("children", [])]
+    fields = {k: v for k, v in data.items() if k != "children"}
+    return cls(**fields, children=children)
+
+
+__all__ = ["Req", "load_spec"]

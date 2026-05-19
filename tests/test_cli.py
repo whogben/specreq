@@ -1,151 +1,161 @@
+"""Tests for the specreq CLI."""
+
 import json
 from pathlib import Path
+from typing import Literal
 
 from typer.testing import CliRunner
 
+from specreq import Req
 from specreq.cli import app
 
 runner = CliRunner()
 
-SPEC_PY = '''\
-from specreq import Requirement
+
+# --- CLI test reqs ---
+
+class _PassReq(Req):
+    kind: Literal["_cli_pass"] = "_cli_pass"
 
 
-class Root(Requirement):
-    pass
+class _BadReq(Req):
+    kind: Literal["_cli_bad"] = "_cli_bad"
 
-
-Root()
-'''
-
-SPEC_NO_INSTANCES = """\
-from specreq import Requirement
-
-
-class Root(Requirement):
-    pass
-"""
-
-SPEC_ERROR = '''\
-from pathlib import Path
-
-from specreq import Requirement
-
-
-class Root(Requirement):
     def validate(self, product: Path) -> list[str]:
-        raise ValueError("spec boom")
+        return ["issue"]
 
 
-Root()
-'''
+class _BoomReq(Req):
+    kind: Literal["_cli_boom"] = "_cli_boom"
 
-SPEC_TWO_ROOTS = '''\
-from specreq import Requirement
-
-
-class A(Requirement):
-    pass
+    def validate(self, product: Path) -> list[str]:
+        raise ValueError("boom")
 
 
-class B(Requirement):
-    pass
+# --- Helpers ---
+
+def _make_project(tmp: Path, spec_json: str, product_name: str = "my_product") -> Path:
+    """Create a minimal project layout in tmp and return it."""
+    (tmp / "reqs").mkdir()
+    (tmp / "specs").mkdir()
+    (tmp / "products" / product_name).mkdir(parents=True)
+    (tmp / "specs" / "test.spec.json").write_text(spec_json)
+    return tmp
 
 
-A()
-B()
-'''
+SINGLE = json.dumps({"kind": "_cli_pass"})
+TWO_ROOTS = json.dumps([{"kind": "_cli_pass"}, {"kind": "_cli_pass"}])
+WITH_ISSUE = json.dumps({"kind": "_cli_bad"})
+WITH_ERROR = json.dumps({"kind": "_cli_boom"})
+UNKNOWN = json.dumps({"kind": "nonexistent"})
 
 
-def _write_spec(tmp: Path, filename: str, content: str) -> Path:
-    p = tmp / filename
-    p.write_text(content)
-    return p
+# --- Auto-discovery tests ---
 
-
-def test_validate_file_spec(tmp_path):
-    spec = _write_spec(tmp_path, "file_spec.py", SPEC_PY)
-    result = runner.invoke(app, [str(spec), str(tmp_path)])
+def test_auto_discover_single_spec_single_product(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, SINGLE)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
     assert result.exit_code == 0
     assert "Valid." in result.stdout
+    assert "1 root(s) passed" in result.stdout
 
 
-def test_validate_twice_same_process_reloads_spec(tmp_path):
-    """Second invoke must rebuild instances after reset (sys.modules cache)."""
-    spec = _write_spec(tmp_path, "reload_spec.py", SPEC_PY)
-    for _ in range(2):
-        result = runner.invoke(app, [str(spec), str(tmp_path)])
-        assert result.exit_code == 0, result.stdout
-        assert "Valid." in result.stdout
-
-
-def test_validate_no_instances(tmp_path):
-    spec = _write_spec(tmp_path, "empty_spec.py", SPEC_NO_INSTANCES)
-    result = runner.invoke(app, [str(spec), str(tmp_path)])
+def test_auto_discover_requires_project_layout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, [])
     assert result.exit_code == 1
-    assert "No Requirement instances" in result.stdout
+    assert "No specs/" in result.stdout
 
 
-def test_validate_missing_product(tmp_path):
-    spec = _write_spec(tmp_path, "prod_spec.py", SPEC_PY)
-    missing = tmp_path / "nope"
-    result = runner.invoke(app, [str(spec), str(missing)])
+def test_auto_discover_ambiguous_specs(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, SINGLE)
+    (project / "specs" / "other.spec.json").write_text(SINGLE)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 1
+    assert "Multiple specs" in result.stdout
+
+
+def test_auto_discover_ambiguous_products(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, SINGLE)
+    (project / "products" / "other_product").mkdir()
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 1
+    assert "Multiple products" in result.stdout
+
+
+# --- Explicit paths (override auto-discovery) ---
+
+def test_explicit_spec_and_product(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, SINGLE)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, ["specs/test.spec.json", f"products/my_product"])
+    assert result.exit_code == 0
+
+
+def test_explicit_spec_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["nope.json", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "Spec file not found" in result.stdout
+
+
+def test_explicit_product_missing(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, SINGLE)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, ["specs/test.spec.json", "products/nope"])
     assert result.exit_code == 1
     assert "Product path does not exist" in result.stdout
 
 
-def test_validate_missing_spec_module(tmp_path):
-    result = runner.invoke(
-        app, ["not_a_real_module_xyz_abc", str(tmp_path)]
-    )
-    assert result.exit_code == 1
-    assert "Could not import spec" in result.stdout
+# --- Validation behavior ---
+
+def test_two_roots(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, TWO_ROOTS)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 0
+    assert "2 root(s) passed" in result.stdout
 
 
-def test_validate_survive_includes_traceback(tmp_path):
-    spec = _write_spec(tmp_path, "boom_spec.py", SPEC_ERROR)
-    result = runner.invoke(app, [str(spec), str(tmp_path)])
+def test_with_issues(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, WITH_ISSUE)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
     assert result.exit_code == 1
-    assert "Traceback (most recent call last)" in result.stdout
+    assert "issue" in result.stdout
+
+
+def test_survive_includes_traceback(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, WITH_ERROR)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 1
+    assert "Traceback" in result.stdout
     assert "exception at" in result.stdout
 
 
-def test_validate_strict_propagates(tmp_path):
-    spec = _write_spec(tmp_path, "strict_spec.py", SPEC_ERROR)
-    result = runner.invoke(app, [str(spec), str(tmp_path), "--strict"])
+def test_strict_propagates(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, WITH_ERROR)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, ["--strict"])
     assert result.exit_code == 1
     assert result.exception is not None
 
 
-def test_validate_two_roots(tmp_path):
-    spec = _write_spec(tmp_path, "two_roots.py", SPEC_TWO_ROOTS)
-    result = runner.invoke(app, [str(spec), str(tmp_path)])
-    assert result.exit_code == 0
-    assert "2 root(s) passed." in result.stdout
+def test_unknown_kind(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, UNKNOWN)
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 1
+    assert "Unknown req kind" in result.stdout
 
 
-def test_validate_save_writes_json(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    spec = _write_spec(tmp_path, "save_me.py", SPEC_PY)
-    result = runner.invoke(app, [str(spec), str(tmp_path), "--save"])
-    assert result.exit_code == 0
-    assert "Saved save_me.json" in result.stdout
-
-    out = tmp_path / "save_me.json"
-    assert out.is_file()
-    data = json.loads(out.read_text())
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert "class" in data[0]
-    assert data[0]["class"].endswith("Root")
-
-
-def test_validate_save_two_roots_json(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    spec = _write_spec(tmp_path, "pair_spec.py", SPEC_TWO_ROOTS)
-    result = runner.invoke(app, [str(spec), str(tmp_path), "--save"])
-    assert result.exit_code == 0
-    data = json.loads((tmp_path / "pair_spec.json").read_text())
-    assert len(data) == 2
-    names = {entry["class"].split(".")[-1] for entry in data}
-    assert names == {"A", "B"}
+def test_invalid_json(tmp_path, monkeypatch):
+    project = _make_project(tmp_path, "not json")
+    monkeypatch.chdir(project)
+    result = runner.invoke(app, [])
+    assert result.exit_code == 1
+    assert "Failed to load spec" in result.stdout

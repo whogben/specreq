@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 README = Path(__file__).resolve().parent.parent / "README.md"
 
 # Matches [text](url) — captures the url part
